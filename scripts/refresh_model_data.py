@@ -44,6 +44,7 @@ SURFACE_HOURLY = [
     "wind_direction_850hPa",
     "geopotential_height_925hPa",
 ]
+CORE_HOURLY = SURFACE_HOURLY[:14]
 
 DETERMINISTIC_MODELS = {
     "ecmwf_ifs": "ecmwf_ifs",
@@ -98,6 +99,24 @@ def normalize(payload: dict, source_model: str) -> dict:
     return result
 
 
+def fetch_model(endpoint: str, model: str, errors: list[str]) -> dict:
+    params = common_params()
+    params["models"] = model
+    try:
+        return fetch_json(endpoint, params)
+    except Exception as detailed_error:
+        # Some providers expose fewer pressure-level fields than others.
+        # Retry with the shared surface fields so one optional field does not
+        # discard an otherwise usable model family.
+        params["hourly"] = ",".join(CORE_HOURLY)
+        payload = fetch_json(endpoint, params)
+        errors.append(
+            f"{model}: upper-level fields unavailable; surface-only retry used "
+            f"({type(detailed_error).__name__})"
+        )
+        return payload
+
+
 def atomic_write(path: pathlib.Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -113,10 +132,8 @@ def main() -> None:
     errors: list[str] = []
     for engine_name, api_model in DETERMINISTIC_MODELS.items():
         try:
-            params = common_params()
-            params["models"] = api_model
             deterministic[engine_name] = normalize(
-                fetch_json("https://api.open-meteo.com/v1/forecast", params),
+                fetch_model("https://api.open-meteo.com/v1/forecast", api_model, errors),
                 api_model,
             )
         except Exception as exc:  # Keep another model usable if one endpoint fails.
@@ -130,10 +147,12 @@ def main() -> None:
 
     ensemble: dict[str, dict] = {}
     try:
-        params = common_params()
-        params["models"] = "icon_seamless_eps"
         ensemble["dwd_icon_eu_eps"] = normalize(
-            fetch_json("https://ensemble-api.open-meteo.com/v1/ensemble", params),
+            fetch_model(
+                "https://ensemble-api.open-meteo.com/v1/ensemble",
+                "icon_seamless_eps",
+                errors,
+            ),
             "icon_seamless_eps",
         )
     except Exception as exc:
