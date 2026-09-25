@@ -1,0 +1,48 @@
+name: LTFM 174-day issue-time backtest
+
+on:
+  push:
+    branches:
+      - "backtest/issue-times-170"
+    paths:
+      - "scripts/backtest_issue_times.py"
+      - "ltfm_engine_v2.py"
+      - ".github/workflows/ltfm-issue-time-backtest.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ltfm-174-day-issue-time-backtest
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Check out the locked LTFM motor
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Replay 174 issue dates at 09:00, 15:00, and 22:00
+        run: >-
+          python scripts/backtest_issue_times.py
+          --start-date 2026-04-02
+          --end-date 2026-09-22
+          --out backtest-output
+          --workers 8
+
+      - name: Save predictions and frozen inputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ltfm-174-day-issue-time-backtest
+          path: backtest-output/
+          if-no-files-found: warn
+          retention-days: 90
