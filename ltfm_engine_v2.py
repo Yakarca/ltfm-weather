@@ -11,7 +11,7 @@ import pathlib, re, statistics, urllib.parse, urllib.request
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
-VERSION = 'LTFM-D0D1-LOCKED-v2.0.0-HOURLY-RESIDUAL'
+VERSION = 'LTFM-D0D1-LOCKED-v2.1.0-HOURLY-RESIDUAL-PHYSICS'
 TZ = ZoneInfo('Europe/Istanbul')
 UTC = dt.timezone.utc
 HOUR = dt.timedelta(hours=1)
@@ -24,9 +24,12 @@ FAMILIES = {
  'icon_eu':'ICON','dwd_icon_eu_eps':'ICON',
  'ukmo_global_deterministic_10km':'UKMO','ukmo_global_ensemble_20km':'UKMO',
  'meteofrance_arpege_europe':'ARPEGE'}
-BLOCKS = {'surface':('radiation','cloud','rain'),
-          'airmass':('advection','front'), 'boundary':('mixing','humidity')}
+BLOCKS = {'surface':('radiation','cloud','rain','gust'),
+          'airmass':('advection','front','upper_humidity','shear'),
+          'boundary':('mixing','humidity','pressure_trend')}
 BLOCK_WEIGHTS = {'surface':.45,'airmass':.35,'boundary':.20}
+RUN_TIME_KEYS = ('run_time','initialization_time','generated_at','updated_at',
+                 'issue_time','forecast_reference_time')
 
 def q(x):
     return float(Decimal(str(x)).quantize(Decimal('.000001'), rounding=ROUND_HALF_UP))
@@ -40,6 +43,19 @@ def median(xs):
 def stamp(x):
     t=dt.datetime.fromisoformat(x.replace('Z','+00:00'))
     return t.astimezone(TZ) if t.tzinfo else t.replace(tzinfo=TZ)
+def model_run_time(data):
+    """Return the first trustworthy model issue time exposed by the source."""
+    containers=[data]
+    for key in ('metadata','meta','api_metadata'):
+        value=data.get(key) if isinstance(data,dict) else None
+        if isinstance(value,dict):containers.append(value)
+    for container in containers:
+        for key in RUN_TIME_KEYS:
+            value=container.get(key)
+            if isinstance(value,str):
+                try:return stamp(value)
+                except (TypeError,ValueError):continue
+    return None
 def canonical(x): return json.dumps(x,sort_keys=True,separators=(',',':'),ensure_ascii=False,allow_nan=False)
 def digest(x): return hashlib.sha256(canonical(x).encode()).hexdigest()
 def wmedian(pairs):
@@ -78,6 +94,7 @@ def hourly_solar(t):
 class Series:
     def __init__(self,name,data,member=0,ensemble=False):
         self.name=name; self.family=FAMILIES[name];self.member=member;self.ensemble=ensemble
+        self.run_time=model_run_time(data)
         self.key=f'{name}:{member:03d}';self.data=data;self.cache={};self.feature_cache={}
         self.audit=collections.Counter()
         self.times=[stamp(t) for t in data['hourly']['time']]
@@ -131,13 +148,17 @@ class Series:
         z=(t-a)/(b-a)
         return angular_lerp(x,y,z) if var.startswith('wind_direction') else q(x+z*(y-x))
 
-def load_series(det,ens,warnings):
+def load_series(det,ens,warnings,cutoff=None):
     ds=[];es=[]
     for ensemble,src,dest in ((False,det,ds),(True,ens,es)):
         for name,data in sorted(src.items()):
             if name not in FAMILIES:
                 warnings.add('Tanınmayan model kullanılmadı: '+name);continue
             if not isinstance(data,dict) or 'hourly' not in data:continue
+            run_time=model_run_time(data)
+            if cutoff is not None and run_time is not None and run_time>cutoff:
+                warnings.add('Karar saatinden sonraki model koşusu kullanılmadı: '+name)
+                continue
             lat=data.get('latitude');lon=data.get('longitude');elev=data.get('elevation')
             if not valid(lat) or not valid(lon) or abs(lat-41.27528)>.5 or abs(lon-28.75194)>.5:
                 warnings.add('Konumu doğrulanamayan model kullanılmadı: '+name);continue
@@ -155,7 +176,8 @@ def getter(s,det,var,t):
     v=s.value(var,t)
     if v is not None:s.audit[var+':member' if s.ensemble else var+':deterministic']+=1;return v
     if var=='temperature_2m':return None
-    candidates=sorted((d for d in det if d.family==s.family and d.key!=s.key),key=lambda d:('ensemble_mean' in d.name,d.name))
+    candidates=sorted((d for d in det if d.family==s.family and d.key!=s.key),
+                      key=lambda d:(0 if 'ensemble_mean' in d.name else 1,d.name))
     for d in candidates:
         v=d.value(var,t)
         if v is not None:s.audit[var+':fallback:'+d.name]+=1;return v
@@ -197,24 +219,49 @@ def features(s,det,t):
         ratio=clip(math.fsum(x for x,y in sums)/math.fsum(y for x,y in sums),0,1.2)
         out['radiation']=q(clip((ratio-.55)/.30,-1,1))
     t925=get('temperature_925hPa'); t850=get('temperature_850hPa')
-    old925=get('temperature_925hPa',t-3*HOUR);old850=get('temperature_850hPa',t-3*HOUR)
+    # A front/air-mass signal is based on both 3-hour and 6-hour evolution,
+    # so one noisy model step cannot dominate the regime match.
+    changes=[]
+    for lag,weight in ((3,.7),(6,.3)):
+        old925=get('temperature_925hPa',t-lag*HOUR)
+        old850=get('temperature_850hPa',t-lag*HOUR)
+        if t925 is not None and old925 is not None:
+            change=t925-old925
+            if t850 is not None and old850 is not None:
+                change=.7*change+.3*(t850-old850)
+            changes.append((weight,change))
     a=None
-    if t925 is not None and old925 is not None:
-        change=t925-old925
-        if t850 is not None and old850 is not None:change=.7*change+.3*(t850-old850)
+    if changes:
+        change=math.fsum(w*x for w,x in changes)/math.fsum(w for w,x in changes)
         a=clip(change/1.2,-1,1)
     d925=get('wind_direction_925hPa');d850=get('wind_direction_850hPa')
     align=(1+math.cos(math.radians(angle(d925,d850))))/2 if d925 is not None and d850 is not None else .5
     if a is not None:out['advection']=q(a*(.6+.4*align))
+    upper_rh=median([get('relative_humidity_925hPa'),get('relative_humidity_850hPa')])
+    if upper_rh is not None:out['upper_humidity']=q(clip((upper_rh-50)/50,-1,1))
     supports=[]
     nowp=get('pressure_msl');oldp=get('pressure_msl',t-3*HOUR)
-    if nowp is not None and oldp is not None:supports.append(clip((nowp-oldp-.5)/2,0,1))
-    for var,threshold in [('wind_direction_10m',30),('wind_direction_925hPa',25)]:
+    if nowp is None or oldp is None:
+        nowp=get('surface_pressure');oldp=get('surface_pressure',t-3*HOUR)
+    if nowp is not None and oldp is not None:
+        pressure_change=nowp-oldp
+        out['pressure_trend']=q(clip(pressure_change/2,-1,1))
+        supports.append(clip((pressure_change-.5)/2,0,1))
+    for var,threshold in [('wind_direction_10m',30),
+                          ('wind_direction_925hPa',25),
+                          ('wind_direction_850hPa',25)]:
         v=get(var);old=get(var,t-3*HOUR)
         if v is not None and old is not None:supports.append(clip((angle(v,old)-threshold)/90,0,1))
     if p is not None:supports.append(clip(p,0,1))
+    if upper_rh is not None:supports.append(clip((upper_rh-60)/40,0,1))
     if a is not None and supports:out['front']=q(-max(0,-out['advection'])*max(supports))
     wind=median([get('wind_speed_10m',z) for z in past]);z925=get('geopotential_height_925hPa')
+    gust=median([get('wind_gusts_10m',z) for z in past])
+    if wind is not None and gust is not None:
+        out['gust']=q(clip((gust-wind-3)/15,-1,1))
+    upper_wind=median([get('wind_speed_925hPa'),get('wind_speed_850hPa')])
+    if wind is not None and upper_wind is not None:
+        out['shear']=q(clip((upper_wind-wind)/20,-1,1))
     if all(x is not None for x in (temp,t925,z925,wind)):
         out['mixing']=q(clip((t925+.0098*(z925-99)-temp-3)/4,-1,1)*clip((wind-10)/20,0,1))
     direction=get('wind_direction_10m')
@@ -320,6 +367,7 @@ def peak_window(weighted_hours):
 
 def evaluate(snapshot,offset):
     warnings=set(snapshot.get('warnings',[]));asof=stamp(snapshot['reference_time'])
+    decision=stamp(snapshot.get('decision_time',snapshot['reference_time']))
     day=dt.date.fromisoformat(snapshot['target_day'])+dt.timedelta(days=offset)
     start=dt.datetime.combine(day,dt.time(),TZ);end=start+24*HOUR
     obs=normalize_obs(snapshot.get('observations',[]),asof)
@@ -332,11 +380,10 @@ def evaluate(snapshot,offset):
         obs_times=[t for t,x in todays]
         if obs_times[0]>start+HOUR or any(b-a>HOUR for a,b in zip(obs_times,obs_times[1:])):
             warnings.add('NOAA gözlem dizisinde boşluk var; görülmemiş ara zirve riski mevcut.')
-    ds,es=load_series(snapshot.get('deterministic',{}),snapshot.get('ensemble',{}),warnings)
-    if ds or es:
-        stamps=('generated_at','run_time','initialization_time','updated_at')
-        if not any(any(k in s.data for k in stamps) for s in ds+es):
-            warnings.add('Model koşu saatleri kaynak dosyalarında belirtilmiyor.')
+    ds,es=load_series(snapshot.get('deterministic',{}),snapshot.get('ensemble',{}),warnings,decision)
+    missing_run_times=sorted({s.name for s in ds+es if s.run_time is None})
+    if missing_run_times:
+        warnings.add('Bazı model koşu saatleri doğrulanamıyor: '+', '.join(missing_run_times))
     requested=[start+i*HOUR for i in range(24) if offset or start+i*HOUR>asof]
     if offset==0 and start<=asof<end:requested=sorted(set([asof]+requested))
     family_results=[];live={};seen_audit={}
@@ -344,7 +391,8 @@ def evaluate(snapshot,offset):
         rows=live_rows(family,ds,es,obs,asof);live[family]=rows
         candidates=[s for s in es if s.family==family]
         if not candidates:
-            d=sorted((s for s in ds if s.family==family),key=lambda s:('ensemble_mean' in s.name,s.name))
+            d=sorted((s for s in ds if s.family==family),
+                     key=lambda s:(0 if 'ensemble_mean' in s.name else 1,s.name))
             candidates=d[:1]
         accepted=[]
         for s in candidates:
@@ -362,7 +410,10 @@ def evaluate(snapshot,offset):
                 f=features(s,ds,t);c,n=correction(f,rows,t)
                 adjusted.append((q(temp+c),t,c,n,f))
             best=max(adjusted,key=lambda r:(r[0],-r[1].timestamp()))
-            accepted.append({'model':s.name,'member':s.member,'max':best[0],'time':best[1].isoformat(),'live_correction':best[2],'matched_hours':best[3],'features':best[4]})
+            accepted.append({'model':s.name,'member':s.member,'max':best[0],
+                            'time':best[1].isoformat(),'live_correction':best[2],
+                            'matched_hours':best[3],'features':best[4],
+                            'run_time':s.run_time.isoformat() if s.run_time else None})
             seen_audit[s.key]=dict(sorted(s.audit.items()))
         if len(accepted)<math.ceil(.8*len(candidates)):
             warnings.add('Yetersiz sıcaklık kapsamı nedeniyle aile kullanılmadı: '+family);continue
@@ -374,7 +425,9 @@ def evaluate(snapshot,offset):
         if len(errs)>=3:
             mid=median(errs);residual_scale=q(1.4826*median([abs(e-mid) for e in errs]))
         h=q(math.sqrt(h*h+residual_scale*residual_scale))
-        family_results.append({'family':family,'members':accepted,'bandwidth':h,'recent_residual_scale':residual_scale})
+        family_results.append({'family':family,'members':accepted,'bandwidth':h,
+                               'recent_residual_scale':residual_scale,
+                               'median_max':median(xs),'min_max':min(xs),'max_max':max(xs)})
     if not family_results:
         if offset==0 and asof>=end and floor is not None:p={floor:1.};centers=[];hours=[(t.hour+t.minute/60,1/len(todays)) for t,x in todays if x==floor]
         else:return {'date':day.isoformat(),'status':'unavailable','message':'Kaynaklara erişilemedi veya hedef gün kapsaması yetersiz; yeni tahmin hesaplanamadı.','warnings':sorted(warnings)}
@@ -430,6 +483,11 @@ def render(result):
         elif any(m['matched_hours']>=3 for f in d['families'] for m in f['members']):
             lines.append('Canlı sıcaklık sapması, gündüz/gece ve hava koşulları benzer olan saatlere sabit kuralla uygulandı.')
         else:lines.append('Uygun canlı gözlem eşleşmesi olmayan saatlerde ek sıcaklık düzeltmesi yapılmadı.')
+        summaries=[]
+        for f in d['families']:
+            summaries.append(f"{f['family']}: {f['min_max']}–{f['max_max']}°C "
+                            f"(medyan {f['median_max']}°C, {len(f['members'])} senaryo)")
+        if summaries:lines.append('Model aileleri: '+'; '.join(summaries)+'.')
         neighbors=sorted((k for k in probs if abs(k-d['main_c'])==1),key=lambda k:(-probs[k],k))
         if neighbors:
             k=neighbors[0];risk=f"Gerçek sıcaklık zirvesinin {k}°C sınıfına taşınması; bu sınıfın hesaplanan olasılığı %{probs[k]:.2f}."
@@ -443,17 +501,24 @@ def render(result):
         sections.append('\n'.join(lines))
     return '\n\n---\n\n'.join(sections)+'\n\n*Olasılıklar, geçmiş LTFM sonuçlarıyla henüz kalibre edilmemiş model tahminleridir.*\n'
 
-def fetch(url):
-    headers={'User-Agent':'LTFM-forecast-engine/2.0'}
+def fetch(url,attempts=3):
+    headers={'User-Agent':'LTFM-forecast-engine/2.1'}
     if urllib.parse.urlparse(url).hostname=='api.synopticdata.com':
         # This is the public feed used by the NOAA page, with its normal page origin.
         headers.update({'Referer':'https://www.weather.gov/','Origin':'https://www.weather.gov','User-Agent':'Mozilla/5.0'})
     request=urllib.request.Request(url,headers=headers)
-    with urllib.request.urlopen(request,timeout=30) as r:return r.read()
+    last=None
+    for _ in range(max(1,attempts)):
+        try:
+            with urllib.request.urlopen(request,timeout=30) as r:return r.read()
+        except Exception as e:
+            last=e
+    raise last
 
 def collect():
     started=dt.datetime.now(TZ).replace(microsecond=0)
-    snapshot={'reference_time':started.isoformat(),'target_day':started.date().isoformat(),
+    snapshot={'reference_time':started.isoformat(),'decision_time':started.isoformat(),
+              'target_day':started.date().isoformat(),
               'deterministic':{},'ensemble':{},'observations':[],'warnings':[],'source_hashes':{}}
     for name in ('deterministic','ensemble'):
         try:
@@ -463,7 +528,7 @@ def collect():
     try:
         page=fetch(NOAA).decode();script=fetch('https://www.weather.gov/source/wrh/timeseries/obs.js?v202601121730').decode()
         # Verify the metric table still uses the same field and rounding rule.
-        if not re.search(r'Math\.round\(DATA\.STATION\[0\]\.OBSERVATIONS\.air_temp_set_1\[j\]\)',script):
+        if not re.search(r'Math\.round\s*\(\s*DATA\.STATION\[0\]\.OBSERVATIONS\.air_temp_set_1\s*\[\s*j\s*\]\s*\)',script):
             raise ValueError('NOAA table schema changed')
         if '/source/wrh/apiKey.js' not in page or 'https://api.synopticdata.com/v2/stations/timeseries?' not in script:
             raise ValueError('NOAA data endpoint changed')
@@ -480,11 +545,12 @@ def collect():
         for t,x in zip(obs.get('date_time',[]),obs.get('air_temp_set_1',[])):
             if valid(x) and stamp(t)<=started:snapshot['observations'].append({'station':'LTFM','time':t,'temp_c':x,'valid':True})
     except Exception as e:snapshot['warnings'].append('NOAA kaynağı doğrulanamadı: '+type(e).__name__)
-    # Freeze the time used by all mathematical operations to the observation snapshot.
+    # Freeze the observation cutoff separately from collection completion.
     # With unavailable current-day observations, D0 is explicitly model-only from midnight.
     current=[stamp(r['time']) for r in snapshot['observations'] if stamp(r['time']).date()==started.date()]
     snapshot['reference_time']=(max(current) if current else started.replace(hour=0,minute=0,second=0)).isoformat()
     if current and started-max(current)>2*HOUR:snapshot['warnings'].append('Canlı NOAA gözlemi iki saatten eski; veri gecikmesi var.')
+    snapshot['decision_time']=dt.datetime.now(TZ).replace(microsecond=0).isoformat()
     return snapshot
 
 def main():
