@@ -60,8 +60,9 @@ def load_noaa_labels(path: pathlib.Path) -> dict[str, int]:
 def write_csv(path: pathlib.Path, rows: list[dict]) -> None:
     if not rows:
         return
+    fieldnames = list(dict.fromkeys(key for row in rows for key in row))
     with path.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -90,6 +91,27 @@ def load_reference_cycles(snapshot_dir: pathlib.Path | None) -> dict:
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
             continue
     return cycles
+
+
+def load_replay_snapshots(replay_dir: pathlib.Path) -> dict:
+    """Load exact frozen hourly inputs from a prior fetch-only run."""
+    snapshot_dir = replay_dir / "snapshots"
+    snapshots = {}
+    for path in sorted(snapshot_dir.glob("*.json.gz")):
+        with gzip.open(path, "rt", encoding="utf-8") as stream:
+            snapshot = json.load(stream)
+        issue_time = snapshot["backtest_metadata"]["issue_time_local"]
+        issue_day = snapshot["target_day"]
+        selected = snapshot["backtest_metadata"].get("selected_model_runs", {})
+        model_results = []
+        for key, data in snapshot.get("deterministic", {}).items():
+            info = selected.get(key)
+            if isinstance(info, dict):
+                model_results.append({"key": key, "data": data, **info, "warnings": []})
+        snapshots[(issue_day, issue_time)] = (snapshot, model_results)
+    if not snapshots:
+        raise RuntimeError(f"No frozen issue snapshots found in {snapshot_dir}")
+    return snapshots
 
 
 def render(summary: dict) -> str:
@@ -144,57 +166,66 @@ def run(args) -> dict:
         raise SystemExit(f"Need at least 170 issue dates, received {len(issue_days)}")
 
     labels = load_noaa_labels(pathlib.Path(args.noaa_seed))
-    actual_end = end + dt.timedelta(days=1)
-    observations, raw_obs = archive.fetch_observations(start - dt.timedelta(days=1), actual_end)
-    by_day, _ = archive.make_day_index(observations)
-
     tasks = [(day, issue_time) for day in issue_days for issue_time in ISSUE_TIMES]
-    # Several issue times share the same latest six-hour model cycle. Fetch
-    # each unique cycle once, then reuse its immutable run data at each issue
-    # time while rebuilding the issue-time observations and metadata.
-    cycle_representatives = {}
-    for day, issue_time in tasks:
-        cycle = archive.latest_cycle(day, issue_time)
-        cycle_representatives.setdefault(cycle, (day, issue_time))
-    reference_dir = pathlib.Path(args.reference_snapshots) if args.reference_snapshots else None
-    cycle_results = load_reference_cycles(reference_dir)
-    print(f"Reused {len(cycle_results)} archived forecast cycles", flush=True)
-    snapshots = {}
     errors = []
-    missing_cycles = {
-        cycle: representative
-        for cycle, representative in cycle_representatives.items()
-        if cycle not in cycle_results
-    }
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {
-            pool.submit(archive.fetch_issue_models, day, issue_time, args.max_fallback_cycles): cycle
-            for cycle, (day, issue_time) in missing_cycles.items()
-        }
-        for index, future in enumerate(concurrent.futures.as_completed(futures), 1):
-            cycle = futures[future]
-            try:
-                cycle_results[cycle] = future.result()
-            except Exception as exc:
-                errors.append({"forecast_cycle_utc": cycle.isoformat(), "error": str(exc)})
-            if index % 40 == 0 or index == len(futures):
-                print(f"Fetched {index}/{len(futures)} unique forecast cycles; failed={len(errors)}", flush=True)
+    raw_obs = b""
+    replay_dir = pathlib.Path(args.reuse_snapshots) if args.reuse_snapshots else None
+    if replay_dir is not None:
+        snapshots = load_replay_snapshots(replay_dir)
+        obs_path = replay_dir / "issue_observations.csv"
+        if obs_path.exists():
+            raw_obs = obs_path.read_bytes()
+        print(f"Replayed {len(snapshots)} frozen hourly snapshots without network fetches", flush=True)
+    else:
+        actual_end = end + dt.timedelta(days=1)
+        observations, raw_obs = archive.fetch_observations(start - dt.timedelta(days=1), actual_end)
+        by_day, _ = archive.make_day_index(observations)
 
-    for day, issue_time in tasks:
-        cycle = archive.latest_cycle(day, issue_time)
-        if cycle not in cycle_results:
-            continue
-        decision = dt.datetime.combine(day, dt.time.fromisoformat(issue_time), TZ).astimezone(dt.timezone.utc)
-        model_results = copy.deepcopy(cycle_results[cycle])
-        for item in model_results:
-            run_time = archive.parse_stamp(item["run_time"])
-            item["run_age_hours"] = round((decision - run_time).total_seconds() / 3600, 2)
-        try:
-            snapshot = archive.issue_snapshot(day, issue_time, model_results, by_day, actual_end)
-            snapshot["backtest_metadata"]["target_actual_source"] = "NOAA/NWS LTFM labels from data/candidate95_seed.json"
-            snapshots[(day.isoformat(), issue_time)] = (snapshot, model_results)
-        except Exception as exc:
-            errors.append({"issue_date": day.isoformat(), "issue_time": issue_time, "error": str(exc)})
+        # Several issue times share the same latest six-hour model cycle. Fetch
+        # each unique cycle once, then reuse its immutable run data at each issue
+        # time while rebuilding issue-time observations and metadata.
+        cycle_representatives = {}
+        for day, issue_time in tasks:
+            cycle = archive.latest_cycle(day, issue_time)
+            cycle_representatives.setdefault(cycle, (day, issue_time))
+        reference_dir = pathlib.Path(args.reference_snapshots) if args.reference_snapshots else None
+        cycle_results = load_reference_cycles(reference_dir)
+        print(f"Reused {len(cycle_results)} archived forecast cycles", flush=True)
+        snapshots = {}
+        missing_cycles = {
+            cycle: representative
+            for cycle, representative in cycle_representatives.items()
+            if cycle not in cycle_results
+        }
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = {
+                pool.submit(archive.fetch_issue_models, day, issue_time, args.max_fallback_cycles): cycle
+                for cycle, (day, issue_time) in missing_cycles.items()
+            }
+            for index, future in enumerate(concurrent.futures.as_completed(futures), 1):
+                cycle = futures[future]
+                try:
+                    cycle_results[cycle] = future.result()
+                except Exception as exc:
+                    errors.append({"forecast_cycle_utc": cycle.isoformat(), "error": str(exc)})
+                if index % 40 == 0 or index == len(futures):
+                    print(f"Fetched {index}/{len(futures)} unique forecast cycles; failed={len(errors)}", flush=True)
+
+        for day, issue_time in tasks:
+            cycle = archive.latest_cycle(day, issue_time)
+            if cycle not in cycle_results:
+                continue
+            decision = dt.datetime.combine(day, dt.time.fromisoformat(issue_time), TZ).astimezone(dt.timezone.utc)
+            model_results = copy.deepcopy(cycle_results[cycle])
+            for item in model_results:
+                run_time = archive.parse_stamp(item["run_time"])
+                item["run_age_hours"] = round((decision - run_time).total_seconds() / 3600, 2)
+            try:
+                snapshot = archive.issue_snapshot(day, issue_time, model_results, by_day, actual_end)
+                snapshot["backtest_metadata"]["target_actual_source"] = "NOAA/NWS LTFM labels from data/candidate95_seed.json"
+                snapshots[(day.isoformat(), issue_time)] = (snapshot, model_results)
+            except Exception as exc:
+                errors.append({"issue_date": day.isoformat(), "issue_time": issue_time, "error": str(exc)})
 
     out = pathlib.Path(args.out)
     snapshot_dir = out / "snapshots"
@@ -335,6 +366,7 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--max-fallback-cycles", type=int, default=2)
     parser.add_argument("--reference-snapshots", default="")
+    parser.add_argument("--reuse-snapshots", default="")
     args = parser.parse_args()
     if not 1 <= args.workers <= 16:
         parser.error("--workers must be between 1 and 16")

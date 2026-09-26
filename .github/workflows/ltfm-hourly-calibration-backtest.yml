@@ -28,14 +28,14 @@ jobs:
       - name: Check out the locked LTFM motor
         uses: actions/checkout@v4
 
-      - name: Restore frozen 09:00, 15:00, and 22:00 model runs
+      - name: Restore frozen all-hour issue snapshots
         uses: actions/download-artifact@v4
         with:
-          name: ltfm-174-day-issue-time-backtest
+          name: ltfm-all-eight-hour-noaa-backtest
           repository: Yakarca/ltfm-weather
-          run-id: 36147447426
+          run-id: 36246640151
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          path: reference-backtest-inputs
+          path: frozen-hourly-inputs
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -45,14 +45,14 @@ jobs:
       - name: Install calibration dependencies
         run: python -m pip install numpy scikit-learn
 
-      - name: Replay 174 dates at all eight forecast slots
+      - name: Score the frozen 174-day archive at all eight forecast slots
         run: >-
           python scripts/backtest_hourly_calibration.py
           --start-date 2026-04-02
           --end-date 2026-09-22
           --out hourly-backtest-output
           --workers 8
-          --reference-snapshots reference-backtest-inputs/snapshots
+          --reuse-snapshots frozen-hourly-inputs
 
       - name: Save NOAA walk-forward results and hourly seed
         if: always()
