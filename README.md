@@ -10,15 +10,20 @@ Akış:
 4. Sonuçlar Actions artifact’ı olarak saklanır ve tek bir GitHub issue’sine yorumlanır.
 5. Yorumda `@Yakarca` mention’ı bulunduğu için GitHub hesap bildirimi oluşur.
 
-Zamanlama GitHub Actions cron ifadesiyle `0 */3 * * *` şeklindedir. Ayrıca elle çalıştırma (`workflow_dispatch`) açıktır.
+Zamanlama her üç saatte bir çalışır; ayrıca NOAA düzeltmesi için her gün 22:00 TRT çalışması vardır. Elle çalıştırma (`workflow_dispatch`) da açıktır.
 
-## Önemli sınır
+## NOAA doğrulaması ve sınırlar
 
-Motorun olasılıkları geçmiş LTFM sonuçlarıyla tam kalibre edilmiş bir başarı garantisi değildir. 174 günlük araştırmadaki hedef içi skor ile canlı, ileriye dönük doğruluk aynı şey değildir; workflow her çalışmanın kaynak snapshot’ını ve sonucu artifact olarak saklar.
+22:00 TRT çalışmasında yarının ana sıcaklık derecesine, önceki 60 NOAA etiketinden öğrenen sınırlı bir nokta düzeltmesi uygulanır. NOAA tohum verisi `data/candidate95_seed.json` içindedir; yeni tahminler NOAA günü tamamlandıktan sonra geçmişe eklenir. Düzeltme olasılık yüzdelerini değiştirmez; bu yüzdeler kalibre edilmiş değildir.
+
+Kayıtları yeterli 171 günde yürüyen NOAA testi, düzeltilmiş motor için 91/171 tam isabet (%53,22), MAE 0,637°C ve ±1°C içinde %88,89 verdi. Aynı NOAA günlerinde v2.1 tabanı 89/171 (%52,05), MAE 0,661°C ve ±1°C içinde %87,13 verdi. Üç gün yalnızca altı saatlik NOAA raporu içerdiği için karşılaştırmaya alınmadı. Daha önce görülen 95/174 skor NOAA-only sonucu olarak doğrulanmadı.
+
+Bu test 174 günlük veriyle yapılmış olsa da doğrulanan karşılaştırma 171 tam kayıtlı gündedir; yürüyen test skoru gelecekte aynı artışın süreceğini garanti etmez. Her canlı çalışmanın kaynak snapshot’ı ve sonucu Actions artifact’ında saklanır.
 
 ## Dosyalar
 
 - `ltfm_engine_v2.py`: kilitli LTFM D0/D1 motoru.
+- `ltfm_candidate95.py`: NOAA geçmişiyle yürüyen D1 nokta düzeltmesi.
 - `scripts/refresh_model_data.py`: canlı model verisini üretir.
 - `scripts/run_ltfm.py`: motoru aynı çalışmadaki yerel snapshot’la çalıştırır.
 - `.github/workflows/ltfm-prediction.yml`: üç saatlik Actions ve GitHub issue bildirimi.

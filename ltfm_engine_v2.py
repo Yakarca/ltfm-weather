@@ -4,7 +4,7 @@
 Run: python ltfm_engine_v2.py --fetch --out run_directory
 Replay: python ltfm_engine_v2.py --replay run_directory/snapshot.json --out replay
 The snapshot, including the frozen reference time, is the complete input.
-No historical fit is bundled. Default probabilities are UNCALIBRATED estimates.
+The scheduled runner applies a NOAA-trained D1 point correction. Probabilities remain UNCALIBRATED estimates.
 """
 import argparse, bisect, collections, datetime as dt, hashlib, json, math
 import pathlib, re, statistics, urllib.parse, urllib.request
@@ -476,8 +476,15 @@ def render(result):
         for k in selected:lines.append(f'- **{k}°C — %{probs[k]:.2f}**')
         other=Decimal(100)-sum(probs[k] for k in selected)
         if other:lines.append(f'- Diğer dereceler — %{other:.2f}')
+        candidate=d.get('candidate95')
+        if candidate and candidate.get('applied'):
+            lines.append(f"NOAA geçmiş kaydıyla doğrulanan nokta düzeltmesi: {candidate['raw_main_c']}°C → {candidate['adjusted_main_c']}°C.")
         lines += ['',f"**⏰ En sıcak saatler:** {d['peak_window']}",'','**Neden?**']
-        lines.append(f"Kullanılabilir {len(d['families'])} model ailesinin saatlik senaryoları birlikte değerlendirildi; en yüksek olasılık {d['main_c']}°C'de toplandı.")
+        if candidate and candidate.get('applied') and candidate['adjusted_main_c'] != candidate['raw_main_c']:
+            mode=min(probs,key=lambda k:(-probs[k],k)) if probs else d['main_c']
+            lines.append(f"Kullanılabilir {len(d['families'])} model ailesinin saatlik senaryoları birlikte değerlendirildi. Yüzde dağılımının en yüksek sınıfı {mode}°C; ana derece NOAA geçmiş doğrulamasındaki nokta düzeltmesini içeriyor.")
+        else:
+            lines.append(f"Kullanılabilir {len(d['families'])} model ailesinin saatlik senaryoları birlikte değerlendirildi; en yüksek olasılık {d['main_c']}°C'de toplandı.")
         if i==0 and d['observed_max'] is not None:
             lines.append(f"NOAA'da bugün {d['observed_max']}°C görüldü; günün kalan saatleri bu gerçekleşmiş maksimumla birleştirildi.")
         elif any(m['matched_hours']>=3 for f in d['families'] for m in f['members']):
