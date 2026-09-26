@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NOAA-verified rolling point correction for the v2.1 LTFM engine."""
+"""Hour-specific NOAA-verified rolling point correction for the v2.1 LTFM engine."""
 from __future__ import annotations
 
 import argparse
@@ -21,6 +21,8 @@ SEED_PATH = ROOT / "data" / "candidate95_seed.json"
 LIVE_PATH = ROOT / "data" / "candidate95_live.json"
 HISTORY_WINDOW = 60
 MAX_CORRECTION_C = 0.5
+FORECAST_SLOTS = ("00", "03", "06", "09", "12", "15", "18", "21")
+SEED_SLOTS = ("09", "15", "22")
 
 
 def number(value):
@@ -41,40 +43,72 @@ def model():
     )
 
 
-def train_predict(history, current, feature_keys):
-    """Fit only on earlier NOAA-labelled dates, then predict one correction."""
+def train_predict(history, current, feature_keys=None):
+    """Fit only on completed NOAA days from the same forecast issue hour."""
     current_issue = current["issue_date"]
+    current_slot = str(current.get("slot", ""))
     rows = [
         row for row in history
+        if str(row.get("slot", "")) == current_slot
         if row.get("issue_date", "") < current_issue
+        and row.get("target_date", "") < current_issue
         and number(row.get("actual_c"))
         and number(row.get("base"))
     ]
-    rows.sort(key=lambda row: row["issue_date"])
+    rows.sort(key=lambda row: (row.get("target_date", ""), row.get("issue_date", "")))
     rows = rows[-HISTORY_WINDOW:]
     if len(rows) < HISTORY_WINDOW:
         return None, len(rows)
 
+    if feature_keys is None:
+        feature_keys = sorted(
+            set(current.get("features", {})).union(
+                *(set(row.get("features", {})) for row in rows)
+            )
+        )
     x_train = np.asarray(
-        [[row.get("features", {}).get(key, np.nan) for key in feature_keys] for row in rows],
+        [[
+            float(row.get("features", {}).get(key))
+            if number(row.get("features", {}).get(key)) else np.nan
+            for key in feature_keys
+        ] for row in rows],
         dtype=float,
     )
     x_current = np.asarray(
-        [[current.get("features", {}).get(key, np.nan) for key in feature_keys]],
+        [[
+            float(current.get("features", {}).get(key))
+            if number(current.get("features", {}).get(key)) else np.nan
+            for key in feature_keys
+        ]],
         dtype=float,
     )
     imputer = SimpleImputer(strategy="median", keep_empty_features=True)
     x_train = imputer.fit_transform(x_train)
     x_current = imputer.transform(x_current)
     keep = x_train.std(axis=0) > 1e-9
-    if not keep.any():
-        return None, len(rows)
-
     residuals = np.asarray([row["actual_c"] - row["base"] for row in rows], dtype=float)
+    if not keep.any():
+        # If a quiet 60-day window has no varying predictors, use a robust
+        # same-hour bias estimate instead of silently skipping calibration.
+        correction = float(statistics.median(residuals))
+        return float(np.clip(correction, -MAX_CORRECTION_C, MAX_CORRECTION_C)), len(rows)
+
     estimator = model()
     estimator.fit(x_train[:, keep], residuals)
     correction = float(estimator.predict(x_current[:, keep])[0])
     return float(np.clip(correction, -MAX_CORRECTION_C, MAX_CORRECTION_C)), len(rows)
+
+
+def corrected_integer(base, correction):
+    """Apply a symmetric whole-degree offset to an integer base forecast."""
+    main = round_noaa(base)
+    if correction is None:
+        return main
+    if correction >= MAX_CORRECTION_C:
+        return main + 1
+    if correction <= -MAX_CORRECTION_C:
+        return main - 1
+    return main
 
 
 def metrics(errors):
@@ -90,40 +124,94 @@ def metrics(errors):
     }
 
 
+def _seed_history(seed):
+    """Build only hour-matched, time-available features from the legacy seed."""
+    history = []
+    for source in sorted(seed.get("history", []), key=lambda row: row["issue_date"]):
+        source_features = source.get("features", {})
+        for slot in SEED_SLOTS:
+            if slot == "22":
+                base = source.get("base")
+                features = dict(source_features)
+                if number(base):
+                    features["d1_current"] = float(base)
+            else:
+                base = source_features.get(f"d1_{slot}")
+                features = {
+                    "base": float(base) if number(base) else np.nan,
+                    "d1_current": float(base) if number(base) else np.nan,
+                }
+                d0 = source_features.get(f"d0_{slot}")
+                if number(d0):
+                    features["d0_current"] = float(d0)
+                for key in ("season_sin", "season_cos"):
+                    if number(source_features.get(key)):
+                        features[key] = float(source_features[key])
+                for prior_slot in SEED_SLOTS:
+                    if int(prior_slot) >= int(slot):
+                        continue
+                    prior_d1 = source_features.get(f"d1_{prior_slot}")
+                    prior_d0 = source_features.get(f"d0_{prior_slot}")
+                    if number(prior_d1):
+                        features[f"d1_prior_{prior_slot}"] = float(prior_d1)
+                    if number(prior_d0):
+                        features[f"d0_prior_{prior_slot}"] = float(prior_d0)
+                hour = int(slot)
+                features["issue_hour_sin"] = math.sin(2 * math.pi * hour / 24)
+                features["issue_hour_cos"] = math.cos(2 * math.pi * hour / 24)
+            if not number(base) or not number(source.get("actual_c")):
+                continue
+            history.append({
+                "issue_date": source["issue_date"],
+                "target_date": source.get(
+                    "target_date",
+                    (dt.date.fromisoformat(source["issue_date"]) + dt.timedelta(days=1)).isoformat(),
+                ),
+                "slot": slot,
+                "base": float(base),
+                "actual_c": float(source["actual_c"]),
+                "features": features,
+            })
+    return history
+
+
 def verify_seed(seed_path=SEED_PATH):
     seed = json.loads(pathlib.Path(seed_path).read_text(encoding="utf-8"))
-    rows = sorted(seed["history"], key=lambda row: row["issue_date"])
-    keys = seed["feature_keys"]
-    baseline_errors = []
-    corrected_errors = []
-    active_baseline_errors = []
-    active_corrected_errors = []
-    first_test = last_test = None
+    history = _seed_history(seed)
+    by_slot = {}
+    for slot in SEED_SLOTS:
+        rows = [row for row in history if row["slot"] == slot]
+        baseline_errors = []
+        corrected_errors = []
+        active_baseline_errors = []
+        active_corrected_errors = []
+        first_test = last_test = None
 
-    for current in rows:
-        correction, train_n = train_predict(rows, current, keys)
-        baseline = round_noaa(current["base"])
-        candidate = round_noaa(current["base"] + correction) if correction is not None else baseline
-        actual = int(current["actual_c"])
-        baseline_errors.append(baseline - actual)
-        corrected_errors.append(candidate - actual)
-        if train_n >= HISTORY_WINDOW and correction is not None:
-            active_baseline_errors.append(baseline - actual)
-            active_corrected_errors.append(candidate - actual)
-            first_test = first_test or current["issue_date"]
-            last_test = current["issue_date"]
+        for current in rows:
+            correction, train_n = train_predict(history, current)
+            baseline = round_noaa(current["base"])
+            candidate = corrected_integer(baseline, correction)
+            actual = int(current["actual_c"])
+            baseline_errors.append(baseline - actual)
+            corrected_errors.append(candidate - actual)
+            if train_n >= HISTORY_WINDOW and correction is not None:
+                active_baseline_errors.append(baseline - actual)
+                active_corrected_errors.append(candidate - actual)
+                first_test = first_test or current["issue_date"]
+                last_test = current["issue_date"]
 
-    return {
-        "source": seed.get("source"),
-        "label_days": len(rows),
-        "candidate_test_days": len(active_corrected_errors),
-        "candidate_test_start": first_test,
-        "candidate_test_end": last_test,
-        "full_period_baseline": metrics(baseline_errors),
-        "full_period_candidate": metrics(corrected_errors),
-        "active_window_baseline": metrics(active_baseline_errors),
-        "active_window_candidate": metrics(active_corrected_errors),
-    }
+        by_slot[slot] = {
+            "label_days": len(rows),
+            "candidate_test_days": len(active_corrected_errors),
+            "candidate_test_start": first_test,
+            "candidate_test_end": last_test,
+            "full_period_baseline": metrics(baseline_errors),
+            "full_period_candidate": metrics(corrected_errors),
+            "active_window_baseline": metrics(active_baseline_errors),
+            "active_window_candidate": metrics(active_corrected_errors),
+        }
+
+    return {"source": seed.get("source"), "by_issue_hour": by_slot}
 
 
 def _probability_features(day, features):
@@ -178,11 +266,35 @@ def _family_features(day, features):
                 features[f"{prefix}_{key}"] = float(value)
 
 
-def build_live_features(snapshot, result, issue_date, slots):
+def build_live_features(snapshot, result, issue_date, slots, slot):
     day = result["days"][1]
     features = {}
     _probability_features(day, features)
     _family_features(day, features)
+    hour = int(slot)
+    features["d1_current"] = float(day["main_c"])
+    features["issue_hour_sin"] = math.sin(2 * math.pi * hour / 24)
+    features["issue_hour_cos"] = math.cos(2 * math.pi * hour / 24)
+
+    d0 = result["days"][0].get("main_c")
+    if number(d0):
+        features["d0_current"] = float(d0)
+    prior_d1 = []
+    for prior_slot in FORECAST_SLOTS:
+        if int(prior_slot) >= hour:
+            continue
+        prior = slots.get(prior_slot, {})
+        if number(prior.get("d1")):
+            value = float(prior["d1"])
+            features[f"d1_prior_{prior_slot}"] = value
+            prior_d1.append(value)
+        if number(prior.get("d0")):
+            features[f"d0_prior_{prior_slot}"] = float(prior["d0"])
+    if prior_d1:
+        features["d1_revision_from_first"] = float(day["main_c"]) - prior_d1[0]
+        features["d1_prior_range"] = max(prior_d1 + [float(day["main_c"])]) - min(
+            prior_d1 + [float(day["main_c"])]
+        )
 
     observed = []
     issue = dt.date.fromisoformat(issue_date)
@@ -214,24 +326,8 @@ def build_live_features(snapshot, result, issue_date, slots):
     features["season_sin"] = math.sin(2 * math.pi * day_of_year / 365.25)
     features["season_cos"] = math.cos(2 * math.pi * day_of_year / 365.25)
 
-    d1_values = []
-    for slot in ("09", "15", "22"):
-        value = slots.get(slot, {}).get("d1")
-        if number(value):
-            features[f"d1_{slot}"] = float(value)
-            d1_values.append(float(value))
-    if len(d1_values) >= 2:
-        features["rev_first_last"] = d1_values[-1] - d1_values[0]
-        features["rev_range"] = max(d1_values) - min(d1_values)
-
-    for slot in ("09", "15"):
-        value = slots.get(slot, {}).get("d0")
-        if number(value):
-            features[f"d0_{slot}"] = float(value)
-            if observed:
-                features[f"obs_minus_d0_{slot}"] = max(value_c for stamp, value_c in observed) - float(value)
-    if "d0_09" in features and "d0_15" in features:
-        features["d0_revision"] = features["d0_15"] - features["d0_09"]
+    if number(d0) and observed:
+        features["obs_minus_d0_current"] = max(value_c for stamp, value_c in observed) - float(d0)
 
     return features
 
@@ -273,8 +369,8 @@ def apply_run(run_dir, seed_path=SEED_PATH, live_path=LIVE_PATH, scheduled_slot=
     result = json.loads(result_path.read_text(encoding="utf-8"))
     issue_date = snapshot["target_day"]
     slot = str(scheduled_slot or "")
-    if slot not in ("09", "15", "22"):
-        return {"applied": False, "reason": "outside 09:00 / 15:00 / 22:00 slot"}
+    if slot not in FORECAST_SLOTS:
+        return {"applied": False, "reason": "outside the scheduled three-hour forecast slots"}
     decision = engine.stamp(snapshot.get("decision_time") or snapshot["reference_time"])
     scheduled_time = decision.replace(hour=int(slot), minute=0, second=0, microsecond=0)
     if abs(decision - scheduled_time) > dt.timedelta(minutes=45):
@@ -292,39 +388,63 @@ def apply_run(run_dir, seed_path=SEED_PATH, live_path=LIVE_PATH, scheduled_slot=
         "d0": result["days"][0].get("main_c"),
         "d1": result["days"][1].get("main_c"),
     }
-    response = {"applied": False, "slot": slot, "issue_date": issue_date}
-    if slot == "22":
-        features = build_live_features(snapshot, result, issue_date, slots)
-        current = {
-            "issue_date": issue_date,
-            "target_date": (dt.date.fromisoformat(issue_date) + dt.timedelta(days=1)).isoformat(),
-            "base": float(result["days"][1]["main_c"]),
-            "features": features,
+    features = build_live_features(snapshot, result, issue_date, slots, slot)
+    current = {
+        "issue_date": issue_date,
+        "target_date": (dt.date.fromisoformat(issue_date) + dt.timedelta(days=1)).isoformat(),
+        "slot": slot,
+        "base": float(result["days"][1]["main_c"]),
+        "features": features,
+    }
+    seed = json.loads(pathlib.Path(seed_path).read_text(encoding="utf-8"))
+    history = _seed_history(seed)
+    history.extend(live["live_rows"].values())
+    correction, train_n = train_predict(history, current)
+    row_key = f"{issue_date}:{slot}"
+    live["live_rows"][row_key] = dict(current, actual_c=None)
+    response = {
+        "applied": False,
+        "recorded": True,
+        "slot": slot,
+        "issue_date": issue_date,
+        "training_rows": train_n,
+        "correction_c": correction,
+    }
+    day = result["days"][1]
+    old_main = int(day["main_c"])
+    if correction is None:
+        reason = f"{slot}:00 için {train_n}/{HISTORY_WINDOW} tamamlanmış saat-eşleşmeli gün var"
+        response["reason"] = reason
+    else:
+        new_main = corrected_integer(old_main, correction)
+        day["candidate95"] = {
+            "applied": True,
+            "source": "hour-specific rolling NOAA residual model",
+            "training_slot": slot,
+            "training_rows": train_n,
+            "raw_main_c": old_main,
+            "correction_c": round(correction, 4),
+            "adjusted_main_c": new_main,
         }
-        seed = json.loads(pathlib.Path(seed_path).read_text(encoding="utf-8"))
-        history = list(seed.get("history", []))
-        history.extend(live["live_rows"].values())
-        correction, train_n = train_predict(history, current, seed["feature_keys"])
-        live["live_rows"][issue_date] = dict(current, actual_c=None)
-        response.update({"training_rows": train_n, "correction_c": correction})
-        if correction is not None:
-            day = result["days"][1]
-            old_main = int(day["main_c"])
-            new_main = round_noaa(float(day["main_c"]) + correction)
-            day["candidate95"] = {
-                "applied": True,
-                "source": "171 NOAA-covered historical LTFM target days",
-                "training_rows": train_n,
-                "raw_main_c": old_main,
-                "correction_c": round(correction, 4),
-                "adjusted_main_c": new_main,
-            }
-            day["main_c"] = new_main
-            response.update({"applied": True, "raw_main_c": old_main, "adjusted_main_c": new_main})
-            result.pop("result_sha256", None)
-            result["result_sha256"] = engine.digest(result)
-            result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-            (run_dir / "forecast.md").write_text(engine.render(result), encoding="utf-8")
+        day["main_c"] = new_main
+        response.update({"applied": True, "changed": new_main != old_main, "raw_main_c": old_main, "adjusted_main_c": new_main})
+
+    if correction is None:
+        day["candidate95"] = {
+            "applied": False,
+            "source": "hour-specific rolling NOAA residual model",
+            "training_slot": slot,
+            "training_rows": train_n,
+            "raw_main_c": old_main,
+            "reason": reason,
+        }
+    result.pop("result_sha256", None)
+    result["result_sha256"] = engine.digest(result)
+    result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    forecast = engine.render(result)
+    if correction is None:
+        forecast += f"\n\n> Saatlik NOAA kalibrasyonu: {reason}; bu çalıştırmada nokta düzeltmesi uygulanmadı."
+    (run_dir / "forecast.md").write_text(forecast, encoding="utf-8")
 
     pathlib.Path(live_path).parent.mkdir(parents=True, exist_ok=True)
     pathlib.Path(live_path).write_text(json.dumps(live, ensure_ascii=False, indent=2), encoding="utf-8")

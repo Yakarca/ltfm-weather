@@ -3,8 +3,6 @@ name: LTFM prediction every 3 hours
 on:
   schedule:
     - cron: "0 */3 * * *"
-    - cron: "0 22 * * *"
-      timezone: "Europe/Istanbul"
   workflow_dispatch:
 
 permissions:
@@ -43,9 +41,9 @@ jobs:
           slot=""
           if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
             hour="$(TZ=Europe/Istanbul date +%H)"
-            if [ "$hour" = "09" ] || [ "$hour" = "15" ] || [ "$hour" = "22" ]; then
-              slot="$hour"
-            fi
+            case "$hour" in
+              00|03|06|09|12|15|18|21) slot="$hour" ;;
+            esac
           fi
           echo "slot=$slot" >> "$GITHUB_OUTPUT"
           python ltfm_candidate95.py --run-dir ltfm-run --slot "$slot"
