@@ -4,6 +4,9 @@ on:
   schedule:
     - cron: "0 */3 * * *"
   workflow_dispatch:
+  push:
+    paths:
+      - "data/candidate95_hourly_seed.json.gz"
 
 permissions:
   contents: write
@@ -39,12 +42,10 @@ jobs:
         id: candidate95
         run: |
           slot=""
-          if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
-            hour="$(TZ=Europe/Istanbul date +%H)"
-            case "$hour" in
-              00|03|06|09|12|15|18|21) slot="$hour" ;;
-            esac
-          fi
+          hour="$(TZ=Europe/Istanbul date +%H)"
+          case "$hour" in
+            00|03|06|09|12|15|18|21) slot="$hour" ;;
+          esac
           echo "slot=$slot" >> "$GITHUB_OUTPUT"
           python ltfm_candidate95.py --run-dir ltfm-run --slot "$slot"
 
