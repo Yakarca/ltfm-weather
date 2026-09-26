@@ -1,0 +1,53 @@
+name: LTFM all-hour NOAA calibration backtest
+
+on:
+  push:
+    branches:
+      - "backtest/hourly-noaa-calibration"
+    paths:
+      - "scripts/backtest_issue_times.py"
+      - "scripts/backtest_hourly_calibration.py"
+      - "ltfm_candidate95.py"
+      - "ltfm_engine_v2.py"
+      - ".github/workflows/ltfm-hourly-calibration-backtest.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ltfm-hourly-noaa-calibration-backtest
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Check out the locked LTFM motor
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install calibration dependencies
+        run: python -m pip install numpy scikit-learn
+
+      - name: Replay 174 dates at all eight forecast slots
+        run: >-
+          python scripts/backtest_hourly_calibration.py
+          --start-date 2026-04-02
+          --end-date 2026-09-22
+          --out hourly-backtest-output
+          --workers 8
+
+      - name: Save NOAA walk-forward results and hourly seed
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ltfm-all-eight-hour-noaa-backtest
+          path: hourly-backtest-output/
+          if-no-files-found: warn
+          retention-days: 90
