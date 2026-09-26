@@ -440,7 +440,11 @@ def apply_run(run_dir, seed_path=SEED_PATH, live_path=LIVE_PATH, scheduled_slot=
         "features": features,
     }
     seed = json.loads(pathlib.Path(seed_path).read_text(encoding="utf-8"))
-    history = _seed_history(seed)
+    hourly_history = _hourly_seed_history(_read_hourly_seed())
+    hourly_slots = {row["slot"] for row in hourly_history}
+    # Use exact-slot archive rows where available; preserve the legacy fallback for uncovered slots.
+    history = [row for row in _seed_history(seed) if row["slot"] not in hourly_slots]
+    history.extend(hourly_history)
     history.extend(live["live_rows"].values())
     correction, train_n = train_predict(history, current)
     row_key = f"{issue_date}:{slot}"
