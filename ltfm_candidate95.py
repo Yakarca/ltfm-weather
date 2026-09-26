@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import gzip
 import json
 import math
 import pathlib
@@ -18,6 +19,7 @@ import ltfm_engine_v2 as engine
 
 ROOT = pathlib.Path(__file__).resolve().parent
 SEED_PATH = ROOT / "data" / "candidate95_seed.json"
+HOURLY_SEED_PATH = ROOT / "data" / "candidate95_hourly_seed.json.gz"
 LIVE_PATH = ROOT / "data" / "candidate95_live.json"
 HISTORY_WINDOW = 60
 MAX_CORRECTION_C = 0.5
@@ -175,9 +177,50 @@ def _seed_history(seed):
     return history
 
 
+def _hourly_seed_history(seed):
+    """Load archived backtest rows with their exact issue-hour features."""
+    history = []
+    for source in sorted(seed.get("history", []), key=lambda row: row["issue_date"]):
+        slot = str(source.get("slot", "")).zfill(2)
+        base = source.get("base")
+        actual = source.get("actual_c")
+        if slot not in FORECAST_SLOTS or not number(base) or not number(actual):
+            continue
+        issue_date = source.get("issue_date")
+        if not issue_date:
+            continue
+        target_date = source.get(
+            "target_date",
+            (dt.date.fromisoformat(issue_date) + dt.timedelta(days=1)).isoformat(),
+        )
+        features = source.get("features", {})
+        history.append({
+            "issue_date": issue_date,
+            "target_date": target_date,
+            "slot": slot,
+            "base": float(base),
+            "actual_c": float(actual),
+            "features": dict(features) if isinstance(features, dict) else {},
+        })
+    return history
+
+
+def _read_hourly_seed(path=HOURLY_SEED_PATH):
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as stream:
+            return json.load(stream)
+    except FileNotFoundError:
+        return {"history": []}
+
+
 def verify_seed(seed_path=SEED_PATH):
     seed = json.loads(pathlib.Path(seed_path).read_text(encoding="utf-8"))
-    history = _seed_history(seed)
+    hourly_history = _hourly_seed_history(_read_hourly_seed())
+    hourly_slots = {row["slot"] for row in hourly_history}
+    # Prefer the newly reconstructed exact-hour archive wherever available;
+    # keep the older 09/15/22 seed only as a fallback for uncovered slots.
+    history = [row for row in _seed_history(seed) if row["slot"] not in hourly_slots]
+    history.extend(hourly_history)
     by_slot = {}
     for slot in SEED_SLOTS:
         rows = [row for row in history if row["slot"] == slot]
