@@ -13,11 +13,12 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
   group: ltfm-hourly-noaa-calibration-backtest
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   backtest:
@@ -26,6 +27,15 @@ jobs:
     steps:
       - name: Check out the locked LTFM motor
         uses: actions/checkout@v4
+
+      - name: Restore frozen 09:00, 15:00, and 22:00 model runs
+        uses: actions/download-artifact@v4
+        with:
+          name: ltfm-174-day-issue-time-backtest
+          repository: Yakarca/ltfm-weather
+          run-id: 36147447426
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: reference-backtest-inputs
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -42,6 +52,7 @@ jobs:
           --end-date 2026-09-22
           --out hourly-backtest-output
           --workers 8
+          --reference-snapshots reference-backtest-inputs/snapshots
 
       - name: Save NOAA walk-forward results and hourly seed
         if: always()

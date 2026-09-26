@@ -7,6 +7,7 @@ import concurrent.futures
 import copy
 import csv
 import datetime as dt
+import gzip
 import json
 import pathlib
 import sys
@@ -63,6 +64,32 @@ def write_csv(path: pathlib.Path, rows: list[dict]) -> None:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def load_reference_cycles(snapshot_dir: pathlib.Path | None) -> dict:
+    """Reuse prior frozen model runs when their six-hour cycle matches."""
+    cycles = {}
+    if snapshot_dir is None or not snapshot_dir.exists():
+        return cycles
+    for path in sorted(snapshot_dir.glob("*.json.gz")):
+        try:
+            with gzip.open(path, "rt", encoding="utf-8") as stream:
+                snapshot = json.load(stream)
+            issue_day = dt.date.fromisoformat(snapshot["target_day"])
+            issue_time = snapshot["backtest_metadata"]["issue_time_local"]
+            cycle = archive.latest_cycle(issue_day, issue_time)
+            selected = snapshot["backtest_metadata"].get("selected_model_runs", {})
+            model_results = []
+            for key, data in snapshot.get("deterministic", {}).items():
+                info = selected.get(key)
+                if not isinstance(info, dict):
+                    continue
+                model_results.append({"key": key, "data": data, **info, "warnings": []})
+            if model_results:
+                cycles.setdefault(cycle, model_results)
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            continue
+    return cycles
 
 
 def render(summary: dict) -> str:
@@ -129,13 +156,20 @@ def run(args) -> dict:
     for day, issue_time in tasks:
         cycle = archive.latest_cycle(day, issue_time)
         cycle_representatives.setdefault(cycle, (day, issue_time))
-    cycle_results = {}
+    reference_dir = pathlib.Path(args.reference_snapshots) if args.reference_snapshots else None
+    cycle_results = load_reference_cycles(reference_dir)
+    print(f"Reused {len(cycle_results)} archived forecast cycles", flush=True)
     snapshots = {}
     errors = []
+    missing_cycles = {
+        cycle: representative
+        for cycle, representative in cycle_representatives.items()
+        if cycle not in cycle_results
+    }
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
             pool.submit(archive.fetch_issue_models, day, issue_time, args.max_fallback_cycles): cycle
-            for cycle, (day, issue_time) in cycle_representatives.items()
+            for cycle, (day, issue_time) in missing_cycles.items()
         }
         for index, future in enumerate(concurrent.futures.as_completed(futures), 1):
             cycle = futures[future]
@@ -300,6 +334,7 @@ def main() -> None:
     parser.add_argument("--out", default="hourly-backtest-output")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--max-fallback-cycles", type=int, default=2)
+    parser.add_argument("--reference-snapshots", default="")
     args = parser.parse_args()
     if not 1 <= args.workers <= 16:
         parser.error("--workers must be between 1 and 16")
